@@ -9,10 +9,11 @@ load_dotenv()
 
 from app.database import add_subscription
 from app.services import (
+    build_template_params,
     check_flight_existence,
     extract_flight_info,
-    send_whatsapp_text,
 )
+from app.whatsapp_api import send_template, send_text
 
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "")
 
@@ -22,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="WhatsApp Flight Tracker", version="0.2.0")
+app = FastAPI(title="WhatsApp Flight Tracker", version="0.3.0")
 
 
 # ── GET /webhook — Verificação do Facebook ───────────────────────────
@@ -86,14 +87,14 @@ async def _handle_message(user_phone: str, user_text: str) -> None:
         flight_data = await extract_flight_info(user_text)
     except Exception:
         logger.exception("Erro ao chamar a IA")
-        await send_whatsapp_text(
+        await send_text(
             user_phone,
             "Desculpe, tive um problema ao processar sua mensagem. Tente novamente.",
         )
         return
 
     if not flight_data:
-        await send_whatsapp_text(
+        await send_text(
             user_phone,
             "Não consegui identificar um voo na sua mensagem.\n"
             "Tente algo como: *LA3244 amanhã* ou *GOL 1234 dia 20/03*",
@@ -109,7 +110,7 @@ async def _handle_message(user_phone: str, user_text: str) -> None:
         flight_info = await check_flight_existence(flight_iata)
     except Exception:
         logger.exception("Erro ao consultar AviationStack para %s", flight_iata)
-        await send_whatsapp_text(
+        await send_text(
             user_phone,
             f"Não consegui verificar o voo *{flight_iata}* agora. "
             "Tente novamente em alguns instantes.",
@@ -117,7 +118,7 @@ async def _handle_message(user_phone: str, user_text: str) -> None:
         return
 
     if not flight_info:
-        await send_whatsapp_text(
+        await send_text(
             user_phone,
             f"O voo *{flight_iata}* não foi encontrado.\n"
             "Verifique o número e tente novamente (ex: *LA3244*, *G31234*).",
@@ -129,24 +130,27 @@ async def _handle_message(user_phone: str, user_text: str) -> None:
         await add_subscription(user_phone, flight_iata, flight_date)
     except Exception:
         logger.exception("Erro ao salvar no Supabase")
-        # Continua mesmo se falhar o banco — o usuário ainda recebe os dados
 
-    # ── 4. Montar e enviar resposta ──────────────────────────────
-    delay_text = ""
-    if flight_info.get("delay") and flight_info["delay"] > 0:
-        delay_text = f"\n⏱ *Atraso na partida:* {flight_info['delay']} min"
+    # ── 4. Enviar confirmação via template ───────────────────────
+    tpl = build_template_params("tracking_start", {
+        "nome_usuario": user_phone,
+        "numero_voo": flight_iata,
+        "data_voo": flight_date,
+    })
 
-    reply = (
-        f"✅ *Voo {flight_iata} encontrado e monitorado!*\n\n"
-        f"✈️ *Companhia:* {flight_info['airline']}\n"
-        f"📊 *Status:* {flight_info['status']}\n\n"
-        f"🛫 *Partida:* {flight_info['departure_airport']} ({flight_info['departure_iata']})\n"
-        f"   Horário: {flight_info['departure_scheduled']}\n"
-        f"🛬 *Chegada:* {flight_info['arrival_airport']} ({flight_info['arrival_iata']})\n"
-        f"   Horário: {flight_info['arrival_scheduled']}"
-        f"{delay_text}\n\n"
-        f"📅 *Data monitorada:* {flight_date}\n"
-        f"Você receberá atualizações sobre este voo!"
-    )
-    await send_whatsapp_text(user_phone, reply)
+    if tpl:
+        template_name, params = tpl
+        sent = await send_template(user_phone, template_name, params)
+    else:
+        sent = False
+
+    # Fallback: se o template falhar, envia texto simples
+    if not sent:
+        logger.warning("Template falhou para %s, enviando texto simples", user_phone)
+        await send_text(
+            user_phone,
+            f"Voo *{flight_iata}* encontrado e monitorado para {flight_date}! "
+            "Você receberá atualizações sobre este voo.",
+        )
+
     logger.info("Fluxo completo para %s -> %s", user_phone, flight_iata)

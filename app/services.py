@@ -132,41 +132,75 @@ async def check_flight_existence(flight_iata: str) -> dict | None:
         "arrival_iata": arr.get("iata", ""),
         "arrival_scheduled": arr.get("scheduled", "N/A"),
         "delay": dep.get("delay"),
+        "gate": dep.get("gate"),
+        "baggage": arr.get("baggage"),
     }
 
 
 # ─────────────────────────────────────────────────────────────────────
-# Passo 4b — Enviar mensagem de texto via WhatsApp (Meta Cloud API)
+# Mapeamento de status de voo → template do WhatsApp
 # ─────────────────────────────────────────────────────────────────────
 
-WHATSAPP_API_URL = "https://graph.facebook.com/v21.0/{phone_id}/messages"
+FLIGHT_TEMPLATES: dict[str, dict] = {
+    "tracking_start": {
+        "template_name": "flight_tracking_start",
+        "param_keys": ["nome_usuario", "numero_voo", "data_voo"],
+    },
+    "tracking_stop": {
+        "template_name": "flight_tracking_stop",
+        "param_keys": ["numero_voo"],
+    },
+    "delayed": {
+        "template_name": "flight_delay_alert",
+        "param_keys": ["nome_usuario", "numero_voo", "novo_horario", "tempo_atraso"],
+    },
+    "gate_change": {
+        "template_name": "flight_gate_change",
+        "param_keys": ["numero_voo", "novo_portao"],
+    },
+    "boarding": {
+        "template_name": "flight_boarding_start",
+        "param_keys": ["nome_usuario", "numero_voo", "portao"],
+    },
+    "landed": {
+        "template_name": "flight_landed_confirm",
+        "param_keys": ["numero_voo", "aeroporto_destino", "horario_pouso", "esteira"],
+    },
+    "cancelled": {
+        "template_name": "flight_cancelled_alert",
+        "param_keys": ["nome_usuario", "numero_voo", "data_original"],
+    },
+}
 
 
-async def send_whatsapp_text(to: str, body: str) -> None:
+def get_template_for_status(status: str) -> dict | None:
     """
-    Envia uma mensagem de texto simples para o número 'to'
-    usando a Meta Cloud API (WhatsApp Business).
+    Retorna o dict de configuração do template para um status de voo.
+
+    Exemplo:
+        info = get_template_for_status("delayed")
+        # {"template_name": "flight_delay_alert", "param_keys": [...]}
+
+    Retorna None se o status não tiver template mapeado.
     """
-    phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
-    token = os.getenv("WHATSAPP_TOKEN", "")
-    url = WHATSAPP_API_URL.format(phone_id=phone_id)
+    return FLIGHT_TEMPLATES.get(status)
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": body},
-    }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(url, headers=headers, json=payload)
+def build_template_params(status: str, data: dict) -> tuple[str, list[str]] | None:
+    """
+    Dado um status e um dicionário de dados, retorna (template_name, [params])
+    prontos para passar ao whatsapp_api.send_template().
 
-    if resp.status_code != 200:
-        logger.error("Erro ao enviar WhatsApp: %s — %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+    Args:
+        status: Chave do status (ex: 'tracking_start', 'delayed', 'landed')
+        data:   Dict com os valores; as chaves devem corresponder a param_keys.
 
-    logger.info("Mensagem enviada para %s", to)
+    Retorna None se o status não tiver template.
+    """
+    tpl = FLIGHT_TEMPLATES.get(status)
+    if not tpl:
+        logger.warning("Nenhum template mapeado para status: %s", status)
+        return None
+
+    params = [str(data.get(k, "N/A")) for k in tpl["param_keys"]]
+    return tpl["template_name"], params
